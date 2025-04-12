@@ -1,0 +1,7 @@
+@import "tailwindcss";
+@plugin "daisyui";
+
+@theme {
+    --font-sans: "Inter", system-ui, "Roboto", sans-serif;
+    --font-mono: "IBM Plex Mono", SFMono-Regular, monospace;
+}
