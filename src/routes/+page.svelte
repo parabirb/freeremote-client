@@ -84,7 +84,8 @@
             rawOpus: true,
         });
         recorder.ondataavailable = (data) => {
-            if (remoteState?.transmitting) socket.emit("audio", data);
+            if (remoteState?.transmitting && remoteState.mode === "voice")
+                socket.emit("audio", data);
         };
         recorder.start();
         context = new AudioContext({ sampleRate: 48000 });
@@ -236,7 +237,9 @@
     >
         <h1 class="text-3xl font-semibold">freeremote</h1>
         {#if context}
-            <p class="text-center">Please upload your key below to access your remote station.</p>
+            <p class="text-center">
+                Please upload your key below to access your remote station.
+            </p>
             <input
                 accept="text/plain"
                 bind:files
@@ -309,7 +312,10 @@
                     <li><a>PSK31</a></li>
                 </ul>
             </div>
-            <button class="btn btn-soft btn-success" onclick={() => socket.emit("tune")}>Tune</button>
+            <button
+                class="btn btn-soft btn-success"
+                onclick={() => socket.emit("tune")}>Tune</button
+            >
             <div class="flex-grow"></div>
             <p>
                 <a class="link" href="mailto:{clubEmail}">{clubName}</a> - {remoteState
@@ -318,19 +324,36 @@
         </div>
         {#if remoteState?.mode === "voice"}
             <div class="flex flex-col flex-grow items-center p-4">
-                <div class="flex lg:flex-row md:flex-row flex-col w-full flex-grow gap-4">
-                    <div class="flex flex-col items-center justify-center gap-4">
+                <div
+                    class="flex lg:flex-row md:flex-row flex-col w-full flex-grow gap-4"
+                >
+                    <div
+                        class="flex flex-col items-center justify-center gap-4"
+                    >
                         <div
                             class="card card-border bg-base-200 lg:w-[30vw] md:w-[50vw] w-[85vw]"
                         >
                             <div class="card-body font-mono">
                                 <div class="lg:hidden md:hidden flex flex-row">
-                                    <button class="btn btn-soft" onclick={() => socket.emit("frequency", remoteState.frequency - 100)}>
+                                    <button
+                                        class="btn btn-soft"
+                                        onclick={() =>
+                                            socket.emit(
+                                                "frequency",
+                                                remoteState.frequency - 100
+                                            )}
+                                    >
                                         -1 kHz
                                     </button>
-                                    <div class="flex-grow">
-                                    </div>
-                                    <button class="btn btn-soft" onclick={() => socket.emit("frequency", remoteState.frequency + 100)}>
+                                    <div class="flex-grow"></div>
+                                    <button
+                                        class="btn btn-soft"
+                                        onclick={() =>
+                                            socket.emit(
+                                                "frequency",
+                                                remoteState.frequency + 100
+                                            )}
+                                    >
                                         +1 kHz
                                     </button>
                                 </div>
@@ -638,8 +661,14 @@
                                                     <button
                                                         class="btn btn-soft btn-square btn-error material-symbols-outlined"
                                                         onclick={() => {
-                                                            logbook.splice(i, 1);
-                                                            socket.emit("updateLogbook", logbook);
+                                                            logbook.splice(
+                                                                i,
+                                                                1
+                                                            );
+                                                            socket.emit(
+                                                                "updateLogbook",
+                                                                logbook
+                                                            );
                                                         }}
                                                     >
                                                         delete
