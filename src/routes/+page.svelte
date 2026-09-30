@@ -1,228 +1,348 @@
-<script>
-    // deps
+<script lang="ts">
+    // Deps
     import saveAs from "file-saver";
     import { untrack } from "svelte";
-    import io from "socket.io-client";
-    import ADIF from "tcadif/lib/ADIF";
+    import { io } from "socket.io-client";
+    import ADIF, { type Qso } from "tcadif/lib/ADIF";
     import { fade } from "svelte/transition";
-    import BufferQueueNode from "$lib/queue";
     import { OpusDecoder } from "opus-decoder";
-    import { Waterfall } from "$lib/spectrogram";
+    import BufferQueueNode from "$lib/queue";
+    import type {
+        Bands,
+        LoginInfo,
+        Mode,
+        RemoteSocket,
+        RemoteState,
+    } from "$lib/protocol";
 
-    function clamp(val, min, max) {
-        return Math.min(Math.max(val, min), max);
+    function clamp(value: number, min: number, max: number) {
+        return Math.min(Math.max(value, min), max);
     }
 
-    function avg(arr) {
-        return arr.reduce((prev, cur) => prev + cur, 0) / arr.length;
+    function avg(values: Iterable<number> & { readonly length: number }) {
+        let sum = 0;
+        for (const value of values) {
+            sum += value;
+        }
+
+        return sum / values.length;
     }
 
-    const modes = {
+    const modes: Record<Mode, string> = {
         voice: "Voice",
         ft8: "FT8",
         psk31: "PSK31",
     };
 
-    // state vars
-    let status = $state("disconnected");
-    let remoteState = $state();
-    let files = $state();
-    let errors = $state([]);
+    // The sliding windows below smooth the meters: the S-meter averages the
+    // last 25 readings and the SWR meter the last 10.
+    const dbmWindow = 25;
+    const swrWindow = 10;
+    // The queue node is recreated this often to shed accumulated latency
+    const queueResetIntervalMs = 120 * 1000;
+
+    // State vars
+    // "disconnected" shows the key upload screen, "connecting" a spinner and
+    // "connected" the control panel. Set by the socket handlers below.
+    let status = $state<"disconnected" | "connecting" | "connected">(
+        "disconnected",
+    );
+    // Latest radio state pushed by the server
+    let remoteState = $state<RemoteState>();
+    let files = $state<FileList | null>();
+    // Each toast needs a unique id so it can be keyed in the {#each}
+    const errors = $state<{ id: number; message: string }[]>([]);
+    let nextErrorId = 0;
     let dbm = $state(0);
-    let dbmList = $state([0]);
+    const dbmList = $state([0]);
     let pwr = $state(0);
-    let swrList = $state([0]);
-    let swr = $derived(avg(swrList));
-    let context = $state();
+    const swrList = $state([0]);
+    const swr = $derived(avg(swrList));
+    // Created by the "Enable microphone" click: browsers only allow audio
+    // contexts and microphone access after a user gesture.
+    let context = $state<AudioContext>();
     let micGain = $state(1);
     let outputGain = $state(1);
     let micLevel = $state(0);
     let clipping = $state(false);
-    let recorder;
-    let sunits = $derived.by(() => {
-        let average = avg(dbmList);
-        if (average > 79) {
-            return `S9+${average - 73}`;
-        } else {
-            return `S${Math.round(clamp((average + 127) / 6, 1, 9))}`;
-        }
+    let recorder: Recorder | undefined;
+    // S-meter text from the averaged dBm: S1..S9 in 6 dB steps from -127 dBm,
+    // then "S9+N" above that.
+    const sunits = $derived.by(() => {
+        const average = avg(dbmList);
+        return average > 79
+            ? `S9+${average - 73}`
+            : `S${Math.round(clamp((average + 127) / 6, 1, 9))}`;
     });
-    let socket;
-    let canvas;
-    let bands = $state([]);
-    let currentBand = $derived.by(() => {
-        try {
-            let bandKeys = Object.keys(bands);
-            let bandValues = Object.values(bands);
-            return bandKeys[
-                bandValues.indexOf(
-                    bandValues.find(
-                        (band) =>
-                            band.edges[0] <= remoteState.frequency &&
-                            band.edges[1] > remoteState.frequency
-                    )
-                )
-            ];
-        } catch {
+    let socket: RemoteSocket | undefined;
+    let bands = $state<Bands>({});
+    // Name of the band that contains the current frequency (empty if none)
+    const currentBand = $derived.by(() => {
+        if (!remoteState) {
             return "";
         }
+
+        const { frequency } = remoteState;
+        return (
+            Object.keys(bands).find((key) => {
+                const [low, high] = bands[key]!.edges;
+                return low <= frequency && high > frequency;
+            }) ?? ""
+        );
     });
     let clubName = $state("");
     let clubEmail = $state("");
-    let logbook = $state([]);
-    let outputGainNode;
+    let logbook = $state<Qso[]>([]);
+    let outputGainNode: GainNode | undefined;
     let logCallsign = $state("");
     let logTime = $state("");
     let logRstTx = $state("");
     let logRstRx = $state("");
+    // Displayed after the SWR meter; above 50 the reading is treated as infinite
+    const swrText = $derived(
+        swr > 50 ? "∞" : 1 + Math.floor((swr / 11) * 0.5 * 10) / 10,
+    );
 
-    async function enableMic() {
+    // Frequencies are sent in 10 Hz units; the digit at `position` (1 = 10 Hz)
+    function frequencyDigit(position: number) {
+        const digit = Math.floor(
+            ((remoteState?.frequency ?? NaN) % 10 ** position) /
+                10 ** (position - 1),
+        );
+        return Number.isNaN(digit) ? 0 : digit;
+    }
+
+    function changeFrequency(delta: number) {
+        if (remoteState) {
+            socket?.emit("frequency", remoteState.frequency + delta);
+        }
+    }
+
+    function selectBand(band: string) {
+        const target = bands[band]!;
+        // Jump to the band's default frequency for the current mode
+        if (remoteState?.mode === "voice") {
+            socket?.emit("frequency", target.voice[0]!);
+        } else if (remoteState?.mode === "psk31") {
+            socket?.emit("frequency", target.psk31);
+        } else {
+            socket?.emit("frequency", target.ft8);
+        }
+
+        // Close the daisyUI dropdown, which stays open while focused
+        (document.activeElement as HTMLElement | null)?.blur();
+    }
+
+    function pushError(message: string) {
+        errors.unshift({ id: nextErrorId++, message });
+    }
+
+    function downloadLogbook() {
+        const blob = new Blob(
+            [
+                new ADIF({ qsos: logbook }).stringify({
+                    fieldDelim: "\n",
+                    recordDelim: "\n",
+                }),
+            ],
+            { type: "text/plain;charset=utf-8;" },
+        );
+        saveAs(blob, `${remoteState?.currentUser.callsign ?? "logbook"}.adi`);
+    }
+
+    // Start capturing the microphone (opus-recorder global from
+    // static/recorder.js) and create the audio context used for playback.
+    function enableMic() {
         recorder = new Recorder({
+            // 2049 = OPUS_APPLICATION_AUDIO
             encoderApplication: 2049,
             encoderFrameSize: 40,
             streamPages: true,
+            // Emit bare Opus frames, not Ogg pages, so the server can forward them as-is
             rawOpus: true,
         });
+        // Only stream microphone audio while push-to-talk is active in voice mode
         recorder.ondataavailable = (data) => {
-            if (remoteState?.transmitting && remoteState.mode === "voice")
-                socket.emit("audio", data);
+            if (remoteState?.transmitting && remoteState.mode === "voice") {
+                socket?.emit("audio", data);
+            }
         };
+
         recorder.start();
-        context = new AudioContext({ sampleRate: 48000 });
+        context = new AudioContext({ sampleRate: 48_000 });
     }
 
-    // when output gain is changed
+    // When output gain is changed
     $effect(() => {
-        let gainNode = untrack(() => outputGainNode);
-        let gain = outputGain;
-        if (gainNode) gainNode.gain.value = gain;
-    });
-
-    // when mic gain is changed
-    $effect(() => {
-        let leRecorder = untrack(() => recorder);
-        let gain = micGain;
-        if (leRecorder) leRecorder.setRecordingGain(gain);
-    });
-
-    // when the file is uploaded we do the thing
-    $effect(async () => {
-        if (files && files.length > 0) {
-            console.log("connecting :3");
-            status = "connecting";
-            let rawKey = await files[0].text();
-            try {
-                let json = JSON.parse(
-                    rawKey.match(
-                        /{"callsign":"[A-Z0-9]{1,15}","license":"[a-z]+","id":"[0-9]+","url":"[a-z0-9\-\:/.]+","expiration":[0-9]+}/
-                    )[0]
-                );
-                const decoder = new OpusDecoder();
-                await decoder.ready;
-                let queueNode = new BufferQueueNode({
-                    audioContext: context,
-                });
-                outputGainNode = new GainNode(context);
-                queueNode.connect(outputGainNode);
-                outputGainNode.connect(context.destination);
-                // temporary workaround to keep latency from getting too bad, need more empirical testing though
-                setInterval(() => {
-                    queueNode.disconnect(outputGainNode);
-                    queueNode = new BufferQueueNode({
-                        audioContext: context,
-                    });
-                    queueNode.connect(outputGainNode);
-                }, 120 * 1000);
-                socket = io(json.url);
-                window.socket = socket;
-                socket.on("connect", () => {
-                    socket.emit("auth", rawKey);
-                });
-                socket.on("disconnect", () => {
-                    status = "disconnected";
-                });
-                socket.on("state", (state) => {
-                    remoteState = state;
-                });
-                socket.on("dbm", (d) => {
-                    dbm = clamp(d, -121, -33);
-                    dbmList.push(dbm);
-                    if (dbmList.length > 25) dbmList.shift();
-                });
-                socket.on("pwr", (p) => {
-                    pwr = p;
-                });
-                socket.on("swr", (s) => {
-                    swrList.push(swr);
-                    if (swrList.length > 10) swrList.shift();
-                });
-                socket.on("audio", (chunk) => {
-                    queueNode._write(
-                        decoder.decodeFrame(new Uint8Array(chunk))
-                            .channelData[0],
-                        null,
-                        () => {}
-                    );
-                });
-                socket.on("login", (info) => {
-                    bands = info.bands;
-                    clubName = info.clubName;
-                    clubEmail = info.clubEmail;
-                    socket.emit("getLogbook");
-                    status = "connected";
-                });
-                socket.on("logbook", (logs) => {
-                    logbook = logs;
-                });
-                socket.on("error", (err) => errors.unshift(err));
-                // i'm actually not sure we need to do this but meh
-                let untrackedRecorder = untrack(() => recorder);
-                let scriptNode =
-                    untrackedRecorder.audioContext.createScriptProcessor(
-                        4096,
-                        1,
-                        0
-                    );
-                scriptNode.addEventListener("audioprocess", (e) => {
-                    let data = e.inputBuffer.getChannelData(0);
-                    clipping = false;
-                    for (let i = 0; i < data.length; i++) {
-                        if (Math.abs(data[i]) >= 1) {
-                            clipping = true;
-                            break;
-                        }
-                    }
-                    micLevel = Math.min(avg(data.map((x) => Math.abs(x))), 1);
-                });
-                untrackedRecorder.recordingGainNode.connect(scriptNode);
-            } catch (e) {
-                console.log(e);
-                errors.unshift("Invalid key!");
-                status = "disconnected";
-                return;
-            }
+        const gainNode = untrack(() => outputGainNode);
+        const gain = outputGain;
+        if (gainNode) {
+            gainNode.gain.value = gain;
         }
     });
 
-    // submit entry function
+    // When mic gain is changed
+    $effect(() => {
+        const leRecorder = untrack(() => recorder);
+        const gain = micGain;
+        if (leRecorder) {
+            leRecorder.setRecordingGain(gain);
+        }
+    });
+
+    // Validate the uploaded key file, build the audio pipeline and connect to
+    // the station server named in the key.
+    async function connect(file: File) {
+        console.log("connecting :3");
+        status = "connecting";
+        const rawKey = await file.text();
+        try {
+            if (!context || !recorder) {
+                throw new Error("Audio is not enabled");
+            }
+
+            const audioContext = context;
+            const activeRecorder = recorder;
+            // Pull the JSON key object out of the file; the file may carry
+            // extra data (e.g. a signature) around it.
+            const json = JSON.parse(
+                rawKey.match(
+                    /\{"callsign":"[0-9A-Z]{1,15}","license":"[a-z]+","id":"\d+","url":"[\-.\/0-9:a-z]+","expiration":\d+\}/v,
+                )![0],
+            ) as { url: string };
+
+            // Receive pipeline: Opus frames from the server -> decoder ->
+            // queue node (plays PCM back-to-back) -> gain -> speakers
+            const decoder = new OpusDecoder();
+            await decoder.ready;
+            let queueNode = new BufferQueueNode({ audioContext });
+            const gainNode = new GainNode(audioContext);
+            outputGainNode = gainNode;
+            queueNode.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+            // Temporary workaround to keep latency from getting too bad, need more empirical testing though.
+            // Buffered audio piles up over time; swapping in a fresh queue drops it.
+            setInterval(() => {
+                queueNode.disconnect(gainNode);
+                queueNode = new BufferQueueNode({ audioContext });
+                queueNode.connect(gainNode);
+            }, queueResetIntervalMs);
+
+            const activeSocket: RemoteSocket = io(json.url);
+            socket = activeSocket;
+            // eslint-disable-next-line unicorn/no-global-object-property-assignment -- debugging hook
+            globalThis.socket = activeSocket;
+            // Authenticate with the raw key file as soon as we are connected
+            // (also on every reconnect)
+            activeSocket.on("connect", () => {
+                activeSocket.emit("auth", rawKey);
+            });
+            activeSocket.on("disconnect", () => {
+                status = "disconnected";
+            });
+            activeSocket.on("state", (state) => {
+                remoteState = state;
+            });
+            // Signal strength, limited to the S-meter's range
+            activeSocket.on("dbm", (level) => {
+                dbm = clamp(level, -121, -33);
+                dbmList.push(dbm);
+                if (dbmList.length > dbmWindow) {
+                    dbmList.shift();
+                }
+            });
+            activeSocket.on("pwr", (watts) => {
+                pwr = watts;
+            });
+            // Keep a rolling window of SWR readings; the meter shows their average
+            activeSocket.on("swr", (reading) => {
+                swrList.push(reading);
+                if (swrList.length > swrWindow) {
+                    swrList.shift();
+                }
+            });
+            // Decode the Opus frame (mono, 48 kHz) and queue the PCM for playback
+            activeSocket.on("audio", (chunk) => {
+                queueNode._write(
+                    decoder.decodeFrame(new Uint8Array(chunk)).channelData[0]!,
+                    "",
+                    () => {},
+                );
+            });
+            // Login succeeded: the server sends station info, then we fetch the logbook
+            activeSocket.on("login", (info: LoginInfo) => {
+                bands = info.bands;
+                clubName = info.clubName;
+                clubEmail = info.clubEmail;
+                activeSocket.emit("getLogbook");
+                status = "connected";
+            });
+            activeSocket.on("logbook", (logs) => {
+                logbook = logs;
+            });
+            activeSocket.on("error", (message) => {
+                pushError(message);
+            });
+
+            // Mic level meter: tap the recorder's gain node with a script
+            // processor that measures each block's average level and clipping.
+            // I'm actually not sure we need to do this but meh
+            const scriptNode =
+                activeRecorder.audioContext.createScriptProcessor(4096, 1, 0);
+            scriptNode.addEventListener("audioprocess", (event) => {
+                const data = event.inputBuffer.getChannelData(0);
+                clipping = false;
+                for (const sample of data) {
+                    if (Math.abs(sample) >= 1) {
+                        clipping = true;
+                        break;
+                    }
+                }
+
+                micLevel = Math.min(avg(data.map((x) => Math.abs(x))), 1);
+            });
+            activeRecorder.recordingGainNode.connect(scriptNode);
+        } catch (error) {
+            console.log(error);
+            pushError("Invalid key!");
+            status = "disconnected";
+        }
+    }
+
+    // When a key file is uploaded, connect with it
+    $effect(() => {
+        const file = files?.[0];
+        if (file) {
+            connect(file).catch((error: unknown) => {
+                console.error(error);
+            });
+        }
+    });
+
+    // Submit a new logbook entry to the server
     function submitEntry() {
         if (
             logCallsign.length === 0 ||
             logRstRx.length === 0 ||
             logRstTx.length === 0 ||
             logTime.length === 0 ||
-            !/^[0-9]{1,2}:[0-9]{2}$/.test(logTime)
-        )
+            !/^\d{1,2}:\d{2}$/v.test(logTime)
+        ) {
             return;
-        let date = new Date();
-        socket.emit("newEntry", {
+        }
+
+        const date = new Date();
+        socket?.emit("newEntry", {
+            // "HH:MM" -> "HHMMSS" (ADIF time, seconds zeroed)
             TIME_ON: logTime.replace(":", "").padStart(4, "0").padEnd(6, "0"),
             CALL: logCallsign.toUpperCase(),
             MODE: "SSB",
-            QSO_DATE: `${date.getUTCFullYear()}${date.getUTCMonth().toString().padStart(2, "0")}${date.getUTCDate().toString().padStart(2, "0")}`,
+            // ADIF date (YYYYMMDD); getUTCMonth() is zero-based, hence the + 1
+            QSO_DATE: `${date.getUTCFullYear()}${(date.getUTCMonth() + 1).toString().padStart(2, "0")}${date.getUTCDate().toString().padStart(2, "0")}`,
             RST_RCVD: logRstRx,
             RST_SENT: logRstTx,
-            FREQ: (remoteState.frequency / 100000).toString(),
+            // Frequency is in 10 Hz units; the logbook stores MHz
+            FREQ: ((remoteState?.frequency ?? 0) / 100_000).toString(),
         });
         logTime = "";
         logCallsign = "";
@@ -272,36 +392,16 @@
                     tabindex="0"
                     class="dropdown-content menu bg-base-200 rounded-box z-1 w-52 p-2 shadow-sm"
                 >
-                    {#each Object.keys(bands) as band}
+                    {#each Object.keys(bands) as band (band)}
                         <li>
-                            <a
-                                onclick={() => {
-                                    if (remoteState.mode === "voice") {
-                                        socket.emit(
-                                            "frequency",
-                                            bands[band].voice[0]
-                                        );
-                                    } else if (remoteState.mode === "psk31") {
-                                        socket.emit(
-                                            "frequency",
-                                            bands[band].psk31
-                                        );
-                                    } else {
-                                        socket.emit(
-                                            "frequency",
-                                            bands[band].ft8
-                                        );
-                                    }
-                                    document.activeElement.blur();
-                                }}>{band}</a
-                            >
+                            <a onclick={() => selectBand(band)}>{band}</a>
                         </li>
                     {/each}
                 </ul>
             </div>
             <div class="dropdown">
                 <div tabindex="0" role="button" class="btn btn-soft">
-                    {modes[remoteState?.mode]}
+                    {remoteState ? modes[remoteState.mode] : undefined}
                 </div>
                 <ul
                     tabindex="0"
@@ -314,7 +414,7 @@
             </div>
             <button
                 class="btn btn-soft btn-success"
-                onclick={() => socket.emit("tune")}>Tune</button
+                onclick={() => socket?.emit("tune")}>Tune</button
             >
             <div class="flex-grow"></div>
             <p>
@@ -337,22 +437,14 @@
                                 <div class="lg:hidden md:hidden flex flex-row">
                                     <button
                                         class="btn btn-soft"
-                                        onclick={() =>
-                                            socket.emit(
-                                                "frequency",
-                                                remoteState.frequency - 100
-                                            )}
+                                        onclick={() => changeFrequency(-100)}
                                     >
                                         -1 kHz
                                     </button>
                                     <div class="flex-grow"></div>
                                     <button
                                         class="btn btn-soft"
-                                        onclick={() =>
-                                            socket.emit(
-                                                "frequency",
-                                                remoteState.frequency + 100
-                                            )}
+                                        onclick={() => changeFrequency(100)}
                                     >
                                         +1 kHz
                                     </button>
@@ -360,35 +452,21 @@
                                 <div
                                     class="flex flex-row items-center justify-center"
                                 >
-                                    {#each [7, 6, 5, 4, 3, 2, 1] as i}
+                                    {#each [7, 6, 5, 4, 3, 2, 1] as i (i)}
                                         <h1
                                             class="text-6xl"
-                                            onwheel={(e) => {
-                                                e.preventDefault();
-                                                if (e.deltaY < 0) {
-                                                    socket.emit(
-                                                        "frequency",
-                                                        remoteState.frequency +
-                                                            10 ** (i - 1)
-                                                    );
-                                                } else {
-                                                    socket.emit(
-                                                        "frequency",
-                                                        remoteState.frequency -
-                                                            10 ** (i - 1)
-                                                    );
-                                                }
+                                            onwheel={(event) => {
+                                                event.preventDefault();
+                                                // Scroll up raises the digit's place value, down lowers it
+                                                changeFrequency(
+                                                    (event.deltaY < 0
+                                                        ? 1
+                                                        : -1) *
+                                                        10 ** (i - 1),
+                                                );
                                             }}
                                         >
-                                            {(() => {
-                                                let digit = Math.floor(
-                                                    (remoteState?.frequency %
-                                                        10 ** i) /
-                                                        10 ** (i - 1)
-                                                );
-                                                if (isNaN(digit)) return 0;
-                                                else return digit;
-                                            })()}
+                                            {frequencyDigit(i)}
                                         </h1>
                                         {#if i === 3}
                                             <h1 class="text-6xl">.</h1>
@@ -450,20 +528,7 @@
                                                 data-tip="SWR is approximate. Accuracy not guaranteed."
                                             >
                                                 <p>
-                                                    {(() => {
-                                                        if (swr > 50)
-                                                            return "∞";
-                                                        else
-                                                            return (
-                                                                1 +
-                                                                Math.floor(
-                                                                    (swr / 11) *
-                                                                        0.5 *
-                                                                        10
-                                                                ) /
-                                                                    10
-                                                            );
-                                                    })()}:1
+                                                    {swrText}:1
                                                 </p>
                                             </div>
                                         </td>
@@ -556,23 +621,7 @@
                             <h1 class="text-3xl font-semibold">Logbook</h1>
                             <button
                                 class="btn btn-square btn-soft material-symbols-outlined"
-                                onclick={() => {
-                                    let blob = new Blob(
-                                        [
-                                            new ADIF({
-                                                qsos: logbook,
-                                            }).stringify({
-                                                fieldDelim: "\n",
-                                                recordDelim: "\n",
-                                            }),
-                                        ],
-                                        { type: "text/plain;charset=utf-8;" }
-                                    );
-                                    saveAs(
-                                        blob,
-                                        `${remoteState.currentUser.callsign}.adi`
-                                    );
-                                }}
+                                onclick={downloadLogbook}
                             >
                                 download
                             </button>
@@ -595,7 +644,7 @@
                                     <button
                                         class="btn btn-soft join-item"
                                         onclick={() => {
-                                            let date = new Date();
+                                            const date = new Date();
                                             logTime = `${date.getUTCHours().toString().padStart(2, "0")}:${date.getUTCMinutes().toString().padStart(2, "0")}`;
                                         }}
                                     >
@@ -648,7 +697,7 @@
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {#each logbook as entry, i}
+                                        {#each logbook as entry, i (i)}
                                             <tr>
                                                 <td>{entry.CALL}</td>
                                                 <td>{entry.MODE}</td>
@@ -663,11 +712,13 @@
                                                         onclick={() => {
                                                             logbook.splice(
                                                                 i,
-                                                                1
+                                                                1,
                                                             );
-                                                            socket.emit(
+                                                            socket?.emit(
                                                                 "updateLogbook",
-                                                                logbook
+                                                                $state.snapshot(
+                                                                    logbook,
+                                                                ),
                                                             );
                                                         }}
                                                     >
@@ -689,8 +740,12 @@
                         ? 'btn-error'
                         : 'btn-primary'} btn-circle"
                     onclick={() => {
-                        if (!remoteState.transmitting) socket.emit("ptt");
-                        else socket.emit("unptt");
+                        // Toggle push-to-talk
+                        if (remoteState?.transmitting) {
+                            socket?.emit("unptt");
+                        } else {
+                            socket?.emit("ptt");
+                        }
                     }}
                 >
                     <div class="material-symbols-outlined">mic</div>
@@ -698,13 +753,12 @@
             </div>
         {/if}
     </div>
-    <!--<canvas bind:this={canvas} class="w-full h-[25vh]"></canvas>-->
 {/if}
 
 <div class="toast toast-top toast-end">
-    {#each errors as error, i}
+    {#each errors as error, i (error.id)}
         <div role="alert" class="alert alert-error" transition:fade>
-            <span>{error}</span>
+            <span>{error.message}</span>
             <button
                 class="material-symbols-outlined cursor-pointer"
                 onclick={() => {
