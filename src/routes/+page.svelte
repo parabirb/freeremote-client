@@ -254,10 +254,9 @@
             activeSocket.on("pwr", (watts) => {
                 pwr = watts;
             });
-            // NOTE: this pushes the current average rather than the received
-            // reading, so the meter never moves. Kept as-is to preserve behaviour.
-            activeSocket.on("swr", () => {
-                swrList.push(swr);
+            // Keep a rolling window of SWR readings; the meter shows their average
+            activeSocket.on("swr", (reading) => {
+                swrList.push(reading);
                 if (swrList.length > swrWindow) {
                     swrList.shift();
                 }
@@ -338,9 +337,8 @@
             TIME_ON: logTime.replace(":", "").padStart(4, "0").padEnd(6, "0"),
             CALL: logCallsign.toUpperCase(),
             MODE: "SSB",
-            // NOTE: getUTCMonth() is zero-based, so months are off by one.
-            // Kept as-is: the server/logbook format is unchanged by this refactor.
-            QSO_DATE: `${date.getUTCFullYear()}${date.getUTCMonth().toString().padStart(2, "0")}${date.getUTCDate().toString().padStart(2, "0")}`,
+            // ADIF date (YYYYMMDD); getUTCMonth() is zero-based, hence the + 1
+            QSO_DATE: `${date.getUTCFullYear()}${(date.getUTCMonth() + 1).toString().padStart(2, "0")}${date.getUTCDate().toString().padStart(2, "0")}`,
             RST_RCVD: logRstRx,
             RST_SENT: logRstTx,
             // Frequency is in 10 Hz units; the logbook stores MHz
